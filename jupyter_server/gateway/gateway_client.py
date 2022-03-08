@@ -2,6 +2,9 @@
 # Distributed under the terms of the Modified BSD License.
 import json
 import os
+import time
+from tkinter import Y
+import requests
 from socket import gaierror
 
 from tornado import web
@@ -23,7 +26,8 @@ class GatewayClient(SingletonConfigurable):
      to build request arguments out of the various config options.
 
     """
-
+    EXPIRY_TIME = 0
+    KG_HEADER = None
     url = Unicode(
         default_value=None,
         allow_none=True,
@@ -229,6 +233,59 @@ class GatewayClient(SingletonConfigurable):
     def _headers_default(self):
         return os.environ.get(self.headers_env, self.headers_default_value)
 
+    kg_apikey = Unicode(default_value=None, allow_none=True, config=True,
+    help="""The APIKEY of the kernel Gateway.  (JUPYTER_GATEWAY_APIKEY env var)
+    """
+)
+    kg_apikey_env = 'JUPYTER_GATEWAY_APIKEY'
+
+    @default('kg_apikey')
+    def _kg_apikey_default(self):
+        return os.environ.get(self.kg_apikey_env)
+
+    kg_iamurl = Unicode(default_value=None, allow_none=True, config=True,
+        help="""The IAMURL of the kernel Gateway.  (JUPYTER_GATEWAY_IAMURL env var)
+        """
+    )
+    kg_iamurl_env = 'JUPYTER_GATEWAY_IAMURL'
+
+    @default('kg_iamurl')
+    def _kg_iamurl_default(self):
+        return os.environ.get(self.kg_iamurl_env)
+
+
+    kg_iam_headers_default = "{}"
+    kg_iam_headers_env = 'JUPYTER_GATEWAY_IAM_HEADERS'
+    kg_iam_headers = Unicode(default_value=kg_iam_headers_default, allow_none=True, config=True,
+    help="""The iam headers of the kernel Gateway.  (JUPYTER_GATEWAY_IAM_HEADERS env var)
+    """
+)
+    @default('kg_iam_headers')
+    def _kg_iam_headers_default(self):
+        return os.environ.get(self.kg_iam_headers_env, self.kg_iam_headers_default)
+    
+    kg_iam_data_default = "{}"
+    kg_iam_data_env = 'JUPYTER_GATEWAY_IAM_DATA'
+    kg_iam_data = Unicode(default_value=kg_iam_data_default, allow_none=True, config=True,
+    help="""The data for the request of the kernel Gateway.  (JUPYTER_GATEWAY_IAM_DATA env var)
+    """
+)
+
+    @default('kg_iam_data')
+    def _kg_iam_data_default(self):
+        return os.environ.get(self.kg_iam_data_env, self.kg_iam_data_default)
+    
+    kg_iam_grace_period_default = 10
+    kg_iam_grace_period_env = 'JUPYTER_GATEWAY_GRACE_PERIOD'
+    kg_iam_grace_period = Int(Unicode(default_value=kg_iam_grace_period_default, allow_none=True, config=True,
+    help="""The grace period for generating new token (in sec) of the kernel Gateway.  (JUPYTER_GATEWAY_GRACE_PERIOD env var)
+    """
+))
+
+    @default('kg_iam_grace_period')
+    def _kg_iam_grace_period_default(self):
+        return int(os.environ.get(self.kg_iam_grace_period_env, self.kg_iam_grace_period_default))
+    
     auth_token = Unicode(
         default_value=None,
         allow_none=True,
@@ -355,6 +412,45 @@ class GatewayClient(SingletonConfigurable):
     # Ensure KERNEL_LAUNCH_TIMEOUT has a default value.
     KERNEL_LAUNCH_TIMEOUT = int(os.environ.get("KERNEL_LAUNCH_TIMEOUT", 40))
 
+    def HeaderGenerator(self, apiKey, iamurl):
+        if len(self.kg_iam_headers)>2:
+            custom_header = json.loads(os.environ.get("JUPYTER_GATEWAY_IAM_HEADERS", '{}'))
+        else:
+            custom_header = {'Content-Type': 'application/x-www-form-urlencoded'}
+        print(custom_header)
+        print(type(custom_header))
+        if len(self.kg_iam_data)>2:
+            raw_data = json.loads(os.environ.get("JUPYTER_GATEWAY_IAM_DATA", '{}'))
+            raw_data['apikey'] = apiKey
+        else:
+            raw_data = {
+                'grant_type': 'urn:ibm:params:oauth:grant-type:apikey',
+                'apikey': apiKey
+                }
+        print(raw_data)
+        print(type(raw_data))
+        response = requests.post(iamurl, headers = custom_header, data=raw_data)
+        json_response = json.loads(response.text)
+        iam_token = json_response['access_token']
+        expiry_time = json_response['expiration']
+        full_token = "Bearer "+iam_token
+        kg_header={"Authorization":full_token}
+        return kg_header, expiry_time
+
+    def TokenGenerator(self):
+        # list_of_Globals = globals()
+        epoch_time = int(time.time())
+        if epoch_time >= self.EXPIRY_TIME-self.kg_iam_grace_period:
+        #Creating KG_HEADERS before connecting to WebSocket.
+            kg_header, iam_token_expiry = self.HeaderGenerator(self.kg_apikey, self.kg_iamurl)
+            self.KG_HEADER = kg_header
+            self.EXPIRY_TIME = iam_token_expiry
+            KG_HEADERS = kg_header
+        else:
+            KG_HEADERS = self.KG_HEADER
+        return KG_HEADERS
+
+
     def init_static_args(self):
         """Initialize arguments used on every request.  Since these are static values, we'll
         perform this operation once.
@@ -369,7 +465,12 @@ class GatewayClient(SingletonConfigurable):
         # Ensure any adjustments are reflected in env.
         os.environ["KERNEL_LAUNCH_TIMEOUT"] = str(GatewayClient.KERNEL_LAUNCH_TIMEOUT)
 
-        self._static_args["headers"] = json.loads(self.headers)
+        # self._static_args["headers"] = json.loads(self.headers)
+        if self.kg_apikey and self.kg_iamurl is not None:
+            KG_HEADERS = self.TokenGenerator()
+            self._static_args['headers'] = KG_HEADERS
+        else:
+            self._static_args['headers'] = json.loads(self.headers)
         if "Authorization" not in self._static_args["headers"].keys():
             self._static_args["headers"].update(
                 {"Authorization": "{} {}".format(self.auth_scheme, self.auth_token)}
